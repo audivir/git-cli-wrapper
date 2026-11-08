@@ -302,6 +302,8 @@ check "a lock of a dead process is taken over" '[[ "$OUT" == *"GITEA_TOKEN=AT1 "
 
 run gt auth logout --host https://oauth.example.test
 check "gt logout removes the OAuth record" '[[ ! -e "$T/store/oauth.example.test_gt-oauth" ]]'
+check "gt logout of an OAuth login points to the revocation page" \
+  '[[ "$OUT" == *"https://oauth.example.test/user/settings/applications"* ]]'
 
 # the browser cannot reach this machine: its address is pasted and sent to the loopback listener
 if command -v python3 >/dev/null 2>&1; then

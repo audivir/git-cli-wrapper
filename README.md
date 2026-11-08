@@ -71,6 +71,10 @@ its own machine, and the login finishes as if the browser had reached it. This w
 to the normal callback, so nothing needs to be chosen up front. Only addresses on `127.0.0.1` or
 `localhost` are accepted.
 
+`gt auth logout` removes the stored login from the backend, but the authorization stays valid in
+Gitea, because neither `gt` nor Gitea offers a way to revoke it from a client. Revoke it at
+`<instance>/user/settings/applications`. The wrapper prints that address after an OAuth logout.
+
 `--ssh-*`, `--client-cert`, `--client-key`, `--header`, `--insecure`, and `--credential-store`
 are refused. `gt auth status` and `gt auth token` ignore `GITEA_TOKEN`, so they do not see the
 stored login.

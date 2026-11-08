@@ -756,6 +756,8 @@ gt_logout() {
   local host entry
   host="$(gt_current_host "$@")"
   [[ -n "$host" ]] || __die "which instance? give --host <url> or set GITEA_CLI_HOST"
+  local oauth=0
+  __marker_exists "$(gt_oauth_entry "$host")" && oauth=1
   for entry in "$(gt_entry "$host")" "$(gt_oauth_entry "$host")"; do
     if __marker_exists "$entry"; then
       "${backend}_del" "$entry"
@@ -766,6 +768,10 @@ gt_logout() {
   # also drops a login of gt itself. Not logged in is fine.
   env -u GITEA_TOKEN "$real" auth logout "$@" 2>/dev/null || true
   __eprint "token for $host removed ($backend backend)"
+  if ((oauth)); then
+    # gt and Gitea offer no way to revoke an authorization from a client.
+    __eprint "the OAuth authorization stays valid in Gitea: revoke it at $(__gt_url "$host")/user/settings/applications"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
