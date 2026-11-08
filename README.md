@@ -49,11 +49,22 @@ against a config without `hosts.yml`.
 
 ### gt
 
-Only tokens are managed: `gt auth login` reads the token from a terminal prompt or stdin and
-refuses `--oauth`, SSH key, and client certificate options, because the wrapper only stores
-tokens. The instance is selected by `--host`, `GITEA_CLI_HOST`, or `GITEA_INSTANCE_URL`. If none
-is given, the only instance with a stored token is used. `gt auth login` itself needs an explicit
-instance.
+Two kinds of login are managed. The instance is selected by `--host`, `GITEA_CLI_HOST`, or
+`GITEA_INSTANCE_URL`. If none is given, the only instance with a stored login is used, but
+`gt auth login` itself needs an explicit instance.
+
+- **Token**: `gt auth login --host <url>` reads the token from a hidden prompt or from stdin and
+  stores it. `gt` gets it as `GITEA_TOKEN`.
+- **OAuth**: `gt auth login --host <url> --oauth` runs the real login in a temporary config dir
+  and stores its whole record (access token, refresh token, expiry, client id) in the backend.
+  OAuth tokens expire, so before every call the wrapper restores the record, lets `gt` refresh
+  it, writes it back when it changed, and gives `gt` the access token as `GITEA_TOKEN`. This runs
+  under a lock (`mkdir` based, a lock of a dead process is taken over, 60 seconds at most), so
+  concurrent calls do not use the same single-use refresh token twice.
+
+`--ssh-*`, `--client-cert`, `--client-key`, `--header`, `--insecure`, and `--credential-store`
+are refused. `gt auth status` and `gt auth token` ignore `GITEA_TOKEN`, so they do not see the
+stored login.
 
 ## Backends
 
@@ -61,7 +72,7 @@ Set `GIT_CLI_WRAPPER_BACKEND`:
 
 | Value | Storage |
 | ---------- | ------------------------------------------------------------------ |
-| `gopass` | gopass with age, entry `github/gh-token`, `<host>/gh-token`, `<host>/gt-token` |
+| `gopass` | gopass with age, entry `github/gh-token`, `<host>/gh-token`, `<host>/gt-token`, `<host>/gt-oauth` |
 | `keychain` | macOS Keychain, service `git-cli-wrapper`, account `<tool>:<entry>` |
 | `native` | no wrapping, the tool keeps its own storage |
 | `auto` | `native` on macOS, `gopass` elsewhere (default) |

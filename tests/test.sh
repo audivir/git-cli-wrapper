@@ -28,8 +28,41 @@ if [[ "$1 $2" == "auth token" ]]; then
 fi
 echo "gh GH_TOKEN=${GH_TOKEN:-} GH_ENTERPRISE_TOKEN=${GH_ENTERPRISE_TOKEN:-} args=$*"
 EOF
+# the stub gt knows OAuth like gt does: a login writes a stale credential, "auth token" refreshes
+# it, and the server accepts each refresh token once (the refresh takes a moment).
 cat >"$T/real/gt" <<'EOF'
 #!/usr/bin/env bash
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/gitea-cli"
+if [[ "$1 $2" == "auth login" ]]; then
+  host=""
+  while (($#)); do [[ "$1" != --host ]] || host="$2"; shift; done
+  mkdir -p "$cfg/credentials"
+  printf 'version: "1"\nhosts:\n    %s:\n        user: tester\n        oauth_client_id: client-1\n        users:\n            tester:\n                auth_method: oauth\n                credential_store: file\n' "$host" >"$cfg/hosts.yml"
+  printf '{"access_token":"AT0","refresh_token":"RT0","expires_at":"stale"}' >"$cfg/credentials/abc.json"
+  echo RT0 >"$STUB_STORE/server_rt"
+  exit 0
+fi
+if [[ "$1 $2" == "auth token" ]]; then
+  file="$(ls "$cfg"/credentials/*.json 2>/dev/null | head -n1)"
+  [[ -n "$file" ]] || { echo "no credential" >&2; exit 1; }
+  json="$(cat "$file")"
+  at="$(sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p' <<<"$json")"
+  rt="$(sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p' <<<"$json")"
+  if [[ "$json" == *'"expires_at":"stale"'* ]]; then
+    if [[ "$rt" != "$(cat "$STUB_STORE/server_rt")" ]]; then
+      echo "refresh token already used" >&2
+      exit 1
+    fi
+    sleep 0.3
+    n=$(($(cat "$STUB_STORE/refreshes" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$STUB_STORE/refreshes"
+    echo "RT$n" >"$STUB_STORE/server_rt"
+    at="AT$n"
+    printf '{"access_token":"AT%s","refresh_token":"RT%s","expires_at":"fresh"}' "$n" "$n" >"$file"
+  fi
+  printf '%s\n' "$at"
+  exit 0
+fi
 echo "gt GITEA_TOKEN=${GITEA_TOKEN:-} URL=${GITEA_INSTANCE_URL:-} HOST=${GITEA_CLI_HOST:-} args=$*"
 EOF
 
@@ -177,14 +210,50 @@ check "gt logout removes only that login" \
 run gt repos list
 check "the remaining login is the only one again" '[[ "$OUT" == *"GITEA_TOKEN=gt-secret-2 "* ]]'
 
-run_in "x" gt auth login --host https://git.example.test --oauth
-check "gt login refuses OAuth, which the wrapper cannot store" \
+run_in "x" gt auth login --host https://git.example.test --ssh-key /tmp/key
+check "gt login refuses options the wrapper cannot store" \
   '[[ $RC -ne 0 && "$OUT" == *"not supported by the wrapper"* ]]'
 run_in "" gt auth login --with-token
 check "gt login without a host asks for one" '[[ $RC -ne 0 && "$OUT" == *"which instance"* ]]'
 run_in "" gt auth login --host https://git.example.test --with-token
 check "gt login without a token stores nothing" \
   '[[ $RC -ne 0 && ! -e "$T/store/git.example.test_gt-token" ]]'
+
+# gt OAuth
+reset_state
+run gt auth login --host https://oauth.example.test --oauth
+check "gt OAuth login stores one record" \
+  '[[ $RC -eq 0 && -e "$T/store/oauth.example.test_gt-oauth" && ! -e "$T/home/.config/gitea-cli" ]]'
+check "the record holds no plaintext token" '! grep -q "AT0" "$T/store/oauth.example.test_gt-oauth"'
+run gt repos list
+check "the first call refreshes and injects the new token" \
+  '[[ "$OUT" == *"GITEA_TOKEN=AT1 "* && "$(cat "$T/store/refreshes")" == 1 ]]'
+run gt repos list
+check "the refreshed record is stored, so no second refresh" \
+  '[[ "$OUT" == *"GITEA_TOKEN=AT1 "* && "$(cat "$T/store/refreshes")" == 1 ]]'
+check "no credentials stay in the temp dirs" '! ls -d "${TMPDIR:-/tmp}"/git-cli-wrapper.* >/dev/null 2>&1'
+
+# a record that went stale again, refreshed by five calls at once: the single-use refresh token
+# only survives if they take turns.
+reset_state
+run gt auth login --host https://oauth.example.test --oauth
+for i in 1 2 3 4 5; do
+  (run gt repos list; printf '%s\n' "$OUT" >"$T/par.$i") &
+done
+wait
+check "five concurrent calls all get a valid token" \
+  '[[ "$(cat "$T"/par.* | grep -c "GITEA_TOKEN=AT1 ")" == 5 ]]'
+check "and the token was refreshed exactly once" '[[ "$(cat "$T/store/refreshes")" == 1 ]]'
+rm -f "$T"/par.*
+
+mkdir -p "$T/home/.local/state/git-cli-wrapper/gt"
+mkdir "$T/home/.local/state/git-cli-wrapper/gt/lock-oauth.example.test_gt-oauth"
+echo 999999 >"$T/home/.local/state/git-cli-wrapper/gt/lock-oauth.example.test_gt-oauth/pid"
+run gt repos list
+check "a lock of a dead process is taken over" '[[ "$OUT" == *"GITEA_TOKEN=AT1 "* ]]'
+
+run gt auth logout --host https://oauth.example.test
+check "gt logout removes the OAuth record" '[[ ! -e "$T/store/oauth.example.test_gt-oauth" ]]'
 
 # tokens must not appear in the process list of the stub calls: the wrapper never puts them in
 # the arguments of gopass.

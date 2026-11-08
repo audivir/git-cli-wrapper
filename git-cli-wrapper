@@ -15,6 +15,7 @@ set -euo pipefail
 
 TOOL=""
 __tmp_dir=""
+__lock_dir=""
 __tty_state=""
 __passphrase=""
 
@@ -36,6 +37,7 @@ __restore_tty() {
 
 # exit trap: restores terminal echo and removes the tmpfs config dir.
 __cleanup() {
+  [[ -z "$__lock_dir" ]] || rm -rf -- "$__lock_dir"
   __restore_tty
   [[ -z "$__tmp_dir" ]] || rm -rf -- "$__tmp_dir"
 }
@@ -460,16 +462,143 @@ gt_current_host() {
   [[ -z "$found" ]] || echo "$found"
 }
 
+# gopass entry of an OAuth login: <host and path>/gt-oauth.
+gt_oauth_entry() {
+  local url
+  url="$(__gt_url "$1")"
+  echo "${url#*://}/gt-oauth"
+}
+
+# a directory for credentials in plaintext: tmpfs where there is one.
+__secret_tmp_dir() {
+  local base
+  for base in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+    [[ -n "$base" && -d "$base" && -w "$base" ]] || continue
+    (umask 077 && mktemp -d "$base/git-cli-wrapper.XXXXXX")
+    return 0
+  done
+  return 1
+}
+
+# mkdir is atomic everywhere, flock is missing on macOS. A lock whose process is gone is stale.
+__lock() {
+  local dir="$1" waited=0 pid
+  mkdir -p "$(dirname "$dir")"
+  while ! mkdir "$dir" 2>/dev/null; do
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf -- "$dir"
+      continue
+    fi
+    waited=$((waited + 1))
+    ((waited < 600)) || __die "waited 60 seconds for the lock $dir"
+    sleep 0.1
+  done
+  echo "$$" >"$dir/pid"
+  __lock_dir="$dir"
+}
+
+__unlock() {
+  [[ -z "$__lock_dir" ]] || rm -rf -- "$__lock_dir"
+  __lock_dir=""
+}
+
+# the record of an OAuth login is one line: base64 of client id, user, file name, credentials.
+__gt_oauth_pack() {
+  printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | base64 | tr -d '\n'
+}
+
+# writes the config dir that gt expects for the record into $2 (XDG_CONFIG_HOME).
+__gt_oauth_restore() {
+  local record id user file json cfg="$2/gitea-cli"
+  record="$(printf '%s' "$1" | base64 -d)"
+  IFS='|' read -r id user file json <<<"$record"
+  mkdir -p "$cfg/credentials"
+  cat >"$cfg/hosts.yml" <<EOF
+version: "1"
+hosts:
+    $3:
+        user: $user
+        oauth_client_id: $id
+        users:
+            $user:
+                auth_method: oauth
+                credential_store: file
+EOF
+  printf 'version: "1"\ndefault_host: %s\n' "$3" >"$cfg/config.yml"
+  printf '%s' "$json" >"$cfg/credentials/$file"
+}
+
+# prints a valid access token of the stored OAuth login. gt refreshes an expiring token itself,
+# and the refresh token may be single use, so restore, refresh, and write back happen under one
+# lock. A call that waits for it then reads the already refreshed record.
+gt_oauth_token() {
+  local backend="$1" real="$2" host="$3" entry record dir token file json id user stored
+  entry="$(gt_oauth_entry "$host")"
+  dir="$(__secret_tmp_dir)" || __die "no directory for the credentials"
+  __lock "$(__state_dir)/lock-${entry//\//_}"
+  record="$("${backend}_get" "$entry" || true)"
+  if [[ -z "$record" ]]; then
+    __unlock
+    rm -rf -- "$dir"
+    __die "no OAuth login stored for $host"
+  fi
+  __gt_oauth_restore "$record" "$dir" "$host"
+  token="$(XDG_CONFIG_HOME="$dir" env -u GITEA_TOKEN "$real" auth token --host "$host")" || {
+    __unlock
+    rm -rf -- "$dir"
+    return 1
+  }
+  file="$(ls "$dir/gitea-cli/credentials")"
+  json="$(cat "$dir/gitea-cli/credentials/$file")"
+  stored="$(printf '%s' "$record" | base64 -d)"
+  if [[ "${stored#*|*|*|}" != "$json" ]]; then
+    IFS='|' read -r id user _ _ <<<"$stored"
+    __gt_oauth_pack "$id" "$user" "$file" "$json" | "${backend}_set" "$entry" ||
+      __eprint "could not store the refreshed credentials"
+  fi
+  __unlock
+  rm -rf -- "$dir"
+  printf '%s' "$token"
+}
+
+# runs the real OAuth login in a temporary config dir and keeps its record in the backend.
+gt_login_oauth() {
+  local backend="$1" real="$2" host="$3"
+  shift 3
+  local dir file json id user entry key
+  dir="$(__secret_tmp_dir)" || __die "no directory for the credentials"
+  __tmp_dir="$dir"
+  "${backend}_login_begin"
+  XDG_CONFIG_HOME="$dir" env -u GITEA_TOKEN "$real" auth login --host "$host" \
+    --credential-store file "$@" || __die "login failed"
+  key="$(sed -n 's/^    \(.*\):$/\1/p' "$dir/gitea-cli/hosts.yml" | head -n1)"
+  id="$(sed -n 's/^        oauth_client_id: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"
+  user="$(sed -n 's/^        user: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"
+  file="$(ls "$dir/gitea-cli/credentials")"
+  json="$(cat "$dir/gitea-cli/credentials/$file")"
+  [[ -n "$key" && -n "$id" && -n "$user" && -n "$json" ]] || __die "no OAuth login found after login"
+  entry="$(gt_oauth_entry "$key")"
+  "${backend}_login_unlock"
+  __gt_oauth_pack "$id" "$user" "$file" "$json" | "${backend}_set" "$entry" ||
+    __die "could not store the credentials"
+  __marker_write "$entry" "$key"
+  __eprint "OAuth login for $key stored with the $backend backend ($entry)"
+}
+
 # exports the stored token as GITEA_TOKEN for the instance, unless env has a token.
 gt_inject() {
-  local backend="$1" host token
-  shift
+  local backend="$1" real="$2" host token
+  shift 2
   [[ -z "${GITEA_TOKEN:-}" ]] || return 0
   host="$(gt_current_host "$@")"
   [[ -n "$host" ]] || return 0
-  __marker_exists "$(gt_entry "$host")" || return 0
-  token="$("${backend}_get" "$(gt_entry "$host")" || true)"
-  [[ -n "$token" ]] || return 0
+  if __marker_exists "$(gt_oauth_entry "$host")"; then
+    token="$(gt_oauth_token "$backend" "$real" "$host")" || __die "could not refresh the OAuth login"
+  elif __marker_exists "$(gt_entry "$host")"; then
+    token="$("${backend}_get" "$(gt_entry "$host")" || true)"
+  fi
+  [[ -n "${token:-}" ]] || return 0
   export GITEA_TOKEN="$token"
   if [[ -z "${GITEA_CLI_HOST:-}${GITEA_INSTANCE_URL:-}" ]]; then
     export GITEA_INSTANCE_URL
@@ -478,14 +607,14 @@ gt_inject() {
 }
 
 gt_login() {
-  local backend="$1"
+  local backend="$1" real="$2"
   shift 2
-  local arg host token entry
+  local arg host token entry oauth=0
   for arg in "$@"; do
     case "$arg" in
-    --host | --host=* | --with-token | -y | --yes) ;;
-    --oauth | --client-id* | --scopes* | --ssh-* | --client-* | --header* | --insecure | --credential-store*)
-      __die "'$arg' is not supported by the wrapper: it stores a token that you give with --with-token"
+    --oauth | --client-id* | --scopes*) oauth=1 ;;
+    --ssh-* | --client-cert* | --client-key* | --header* | --insecure | --credential-store*)
+      __die "'$arg' is not supported by the wrapper: it stores tokens and OAuth logins only"
       ;;
     esac
   done
@@ -494,6 +623,21 @@ gt_login() {
   host="${host:-${GITEA_CLI_HOST:-${GITEA_INSTANCE_URL:-}}}"
   [[ -n "$host" ]] || __die "which instance? give --host <url> or set GITEA_CLI_HOST"
   host="$(__gt_url "$host")"
+  if ((oauth)); then
+    # --host is given by the wrapper
+    local args=() skip=0
+    for arg in "$@"; do
+      if ((skip)); then
+        skip=0
+      elif [[ "$arg" == "--host" ]]; then
+        skip=1
+      elif [[ "$arg" != --host=* ]]; then
+        args+=("$arg")
+      fi
+    done
+    gt_login_oauth "$backend" "$real" "$host" ${args[@]+"${args[@]}"}
+    return 0
+  fi
   entry="$(gt_entry "$host")"
 
   if [[ -t 0 ]]; then
@@ -518,11 +662,12 @@ gt_logout() {
   local host entry
   host="$(gt_current_host "$@")"
   [[ -n "$host" ]] || __die "which instance? give --host <url> or set GITEA_CLI_HOST"
-  entry="$(gt_entry "$host")"
-  if __marker_exists "$entry"; then
-    "${backend}_del" "$entry"
-  fi
-  __marker_remove "$entry"
+  for entry in "$(gt_entry "$host")" "$(gt_oauth_entry "$host")"; do
+    if __marker_exists "$entry"; then
+      "${backend}_del" "$entry"
+    fi
+    __marker_remove "$entry"
+  done
 
   # also drops a login of gt itself. Not logged in is fine.
   env -u GITEA_TOKEN "$real" auth logout "$@" 2>/dev/null || true
@@ -604,7 +749,7 @@ main() {
       ;;
     status)
       if [[ "$TOOL" == "gh" ]]; then
-        gh_inject "$backend"
+        gh_inject "$backend" "$real"
         gh_status "$real" "$@" || exit_code=$?
         exit "$exit_code"
       fi
@@ -612,7 +757,7 @@ main() {
     esac
   fi
 
-  "${TOOL}_inject" "$backend" "$@"
+  "${TOOL}_inject" "$backend" "$real" "$@"
   exec "$real" "$@"
 }
 
