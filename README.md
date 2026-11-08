@@ -79,6 +79,17 @@ Gitea, because neither `gt` nor Gitea offers a way to revoke it from a client. R
 are refused. `gt auth status` and `gt auth token` ignore `GITEA_TOKEN`, so they do not see the
 stored login.
 
+## Proxy and certificates
+
+`gh` and `gt` are Go programs. They use no PAC file and no system proxy settings, only
+`HTTPS_PROXY` and `HTTP_PROXY`, and they trust the system roots plus `SSL_CERT_FILE`. If
+[`curlp`](https://github.com/audivir/curlp) 0.2.0 or newer is in `PATH`, the wrapper asks it
+(`curlp --curlp-env <url>`) for the instance of the call and sets `HTTPS_PROXY` and `HTTP_PROXY`
+from the PAC, and `SSL_CERT_FILE` to the bundle with its additional certificates. `gh` on
+`github.com` is looked up as `api.github.com`. Variables that are already set win, `socks4`
+proxies are skipped because Go cannot use them, and `GIT_CLI_WRAPPER_CURLP=0` turns this off.
+Without `curlp`, or with an older one, nothing changes.
+
 ## Backends
 
 Set `GIT_CLI_WRAPPER_BACKEND`:

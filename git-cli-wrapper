@@ -810,6 +810,52 @@ __native_login_default() {
   fi
 }
 
+# URL of the instance this call talks to, for the proxy lookup. Prints nothing if unknown.
+__target_url() {
+  local host
+  if [[ "$TOOL" == "gh" ]]; then
+    host="$(gh_host_arg "$@")"
+    host="${host:-${GH_HOST:-github.com}}"
+    # gh talks to the API host of github.com
+    if [[ "$host" == "github.com" ]]; then host="api.github.com"; fi
+    echo "https://$host"
+  else
+    host="$(gt_current_host "$@")"
+    [[ -z "$host" ]] || __gt_url "$host"
+  fi
+}
+
+# asks curlp for the proxy of the PAC and the extra certificates, for the host of this call.
+# gh and gt are Go programs: they use no PAC and only HTTPS_PROXY, so the variables come from
+# curlp. Variables that are already set win. Without curlp, or with an older one, nothing changes.
+# GIT_CLI_WRAPPER_CURLP=0 turns it off.
+__apply_curlp() {
+  local url line name value
+  [[ "${GIT_CLI_WRAPPER_CURLP:-1}" != "0" ]] || return 0
+  command -v curlp >/dev/null 2>&1 || return 0
+  url="$(__target_url "$@")"
+  [[ -n "$url" ]] || return 0
+  while IFS= read -r line; do
+    name="${line%%=*}"
+    value="${line#*=}"
+    [[ -n "$value" ]] || continue
+    case "$name" in
+    HTTPS_PROXY | HTTP_PROXY)
+      # Go speaks http, https, socks5, and socks5h proxies, not socks4.
+      [[ "$value" != socks4://* ]] || continue
+      if [[ -z "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
+        export "$name=$value"
+        if [[ "$name" == "HTTP_PROXY" ]]; then continue; fi
+        export HTTP_PROXY="$value"
+      fi
+      ;;
+    SSL_CERT_FILE)
+      [[ -n "${SSL_CERT_FILE:-}" ]] || export SSL_CERT_FILE="$value"
+      ;;
+    esac
+  done < <(curlp --curlp-env "$url" 2>/dev/null || true)
+}
+
 main() {
   case "$(basename -- "$0")" in
   gh | gt) TOOL="$(basename -- "$0")" ;;
@@ -837,6 +883,7 @@ main() {
   local real backend exit_code=0
   real="$(__find_real)" || exit 1
   backend="$(__backend)"
+  __apply_curlp "$@"
 
   if [[ "$backend" == "native" ]]; then
     if [[ "$(uname -s)" == "Darwin" ]] && command -v security >/dev/null 2>&1 &&

@@ -27,7 +27,7 @@ if [[ "$1 $2" == "auth token" ]]; then
   echo browser-token
   exit 0
 fi
-echo "gh GH_TOKEN=${GH_TOKEN:-} GH_ENTERPRISE_TOKEN=${GH_ENTERPRISE_TOKEN:-} args=$*"
+echo "gh GH_TOKEN=${GH_TOKEN:-} GH_ENTERPRISE_TOKEN=${GH_ENTERPRISE_TOKEN:-} PROXY=${HTTPS_PROXY:-} CA=${SSL_CERT_FILE:-} args=$*"
 EOF
 # the stub gt knows OAuth like gt does: a login writes a stale credential, "auth token" refreshes
 # it, and the server accepts each refresh token once (the refresh takes a moment).
@@ -90,7 +90,20 @@ if [[ "$1 $2" == "auth token" ]]; then
   printf '%s\n' "$at"
   exit 0
 fi
-echo "gt GITEA_TOKEN=${GITEA_TOKEN:-} URL=${GITEA_INSTANCE_URL:-} HOST=${GITEA_CLI_HOST:-} args=$*"
+echo "gt GITEA_TOKEN=${GITEA_TOKEN:-} URL=${GITEA_INSTANCE_URL:-} HOST=${GITEA_CLI_HOST:-} PROXY=${HTTPS_PROXY:-} CA=${SSL_CERT_FILE:-} args=$*"
+EOF
+
+# a curlp that answers --curlp-env: a proxy for proxied.example.test, extra certificates for all.
+cat >"$T/real/curlp" <<'EOF'
+#!/usr/bin/env bash
+[[ "${STUB_CURLP_OLD:-}" != 1 ]] || { echo "curl: option --curlp-env: is unknown" >&2; exit 2; }
+echo "$2" >>"$STUB_STORE/curlp_urls"
+if [[ "$2" == *proxied.example.test* ]]; then
+  echo "HTTPS_PROXY=socks5://127.0.0.1:1111"
+  echo "HTTP_PROXY=socks5://127.0.0.1:1111"
+fi
+[[ "$2" != *socks4.example.test* ]] || echo "HTTPS_PROXY=socks4://127.0.0.1:1"
+echo "SSL_CERT_FILE=/stub/ca-bundle.pem"
 EOF
 
 # a gopass that keeps entries as files.
@@ -345,6 +358,26 @@ check "an unlocked agent is never asked" \
 # the arguments of gopass.
 check "the stub gopass never saw a token as an argument" \
   '! grep -rq "gt-secret" "$T/real" 2>/dev/null'
+
+# proxy and certificates from curlp
+reset_state
+run GH_HOST=proxied.example.test gh api user
+check "gh gets the proxy and certificates of curlp for its host" \
+  '[[ "$OUT" == *"PROXY=socks5://127.0.0.1:1111 CA=/stub/ca-bundle.pem"* && "$(cat "$T/store/curlp_urls")" == *"https://proxied.example.test"* ]]'
+rm -f "$T/store/curlp_urls"
+run gh api user
+check "gh on github.com asks about the API host and gets no proxy" \
+  '[[ "$OUT" == *"PROXY= CA=/stub/ca-bundle.pem"* && "$(cat "$T/store/curlp_urls")" == *"https://api.github.com"* ]]'
+run gt --host https://proxied.example.test repos list
+check "gt gets the proxy of curlp for its instance" '[[ "$OUT" == *"PROXY=socks5://127.0.0.1:1111 CA=/stub/ca-bundle.pem"* ]]'
+run HTTPS_PROXY=http://mine:3128 SSL_CERT_FILE=/mine.pem gt --host https://proxied.example.test repos list
+check "variables that are already set win" '[[ "$OUT" == *"PROXY=http://mine:3128 CA=/mine.pem"* ]]'
+run GIT_CLI_WRAPPER_CURLP=0 gt --host https://proxied.example.test repos list
+check "curlp can be turned off" '[[ "$OUT" == *"PROXY= CA= "* ]]'
+run STUB_CURLP_OLD=1 gt --host https://proxied.example.test repos list
+check "a curlp without --curlp-env changes nothing" '[[ $RC -eq 0 && "$OUT" == *"PROXY= CA= "* ]]'
+run gt --host https://socks4.example.test repos list
+check "a socks4 proxy is skipped, as Go cannot use it" '[[ "$OUT" == *"PROXY= CA=/stub/ca-bundle.pem"* ]]'
 
 # structure
 reset_state
