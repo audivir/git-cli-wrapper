@@ -83,7 +83,7 @@ stored login.
 
 `gh` and `gt` are Go programs. They use no PAC file and no system proxy settings, only
 `HTTPS_PROXY` and `HTTP_PROXY`, and they trust the system roots plus `SSL_CERT_FILE`. If
-[`curlp`](https://github.com/audivir/curlp) 0.2.0 or newer is in `PATH`, the wrapper asks it
+[`curlp`](https://github.com/audivir/curlp) 0.1.1 or newer is in `PATH`, the wrapper asks it
 (`curlp --curlp-env <url>`) for the instance of the call and sets `HTTPS_PROXY` and `HTTP_PROXY`
 from the PAC, and `SSL_CERT_FILE` to the bundle with its additional certificates. `gh` on
 `github.com` is looked up as `api.github.com`. Variables that are already set win, `socks4`
