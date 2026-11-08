@@ -19,6 +19,7 @@ ln -s "$WRAPPER" "$T/wrap/gt"
 cat >"$T/real/gh" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1 $2" == "auth login" ]]; then
+  echo "$*" >>"$STUB_STORE/gh_login_args"
   printf 'github.com:\n    oauth_token: browser-token\n' >"$GH_CONFIG_DIR/hosts.yml"
   exit 0
 fi
@@ -179,6 +180,14 @@ printf 'legacy-token\n' >"$T/store/github_gh-token"
 run gh api user
 check "gh still finds the marker of the former wrapper" '[[ "$OUT" == *"GH_TOKEN=legacy-token "* ]]'
 
+reset_state
+run gh auth login
+check "gh login uses the browser flow by default" \
+  '[[ $RC -eq 0 && "$(cat "$T/store/gh_login_args")" == *"--web"* ]]'
+rm -f "$T/store/gh_login_args"
+run_in "tok" gh auth login --with-token
+check "gh login with a token does not add --web" '[[ "$(cat "$T/store/gh_login_args" 2>/dev/null)" != *"--web"* ]]'
+
 # gt
 reset_state
 run gt repos list
@@ -221,8 +230,8 @@ check "gt login without a token stores nothing" \
 
 # gt OAuth
 reset_state
-run gt auth login --host https://oauth.example.test --oauth
-check "gt OAuth login stores one record" \
+run gt auth login --host https://oauth.example.test
+check "gt login is OAuth by default and stores one record" \
   '[[ $RC -eq 0 && -e "$T/store/oauth.example.test_gt-oauth" && ! -e "$T/home/.config/gitea-cli" ]]'
 check "the record holds no plaintext token" '! grep -q "AT0" "$T/store/oauth.example.test_gt-oauth"'
 run gt repos list

@@ -30,10 +30,11 @@ The wrapper finds the real tool by skipping itself in `PATH`. It can also be cal
 ## Usage
 
 ```bash
-gh auth login                    # browser or device flow, the token goes to the backend
+gh auth login                    # browser flow, the token goes to the backend
 gh auth login --with-token < f   # store a token you already have
 gh auth logout
-gt auth login --host https://git.example.com   # asks for the token, hidden
+gt auth login --host https://git.example.com   # OAuth in the browser
+gt auth login --host https://git.example.com --with-token   # token from stdin or a hidden prompt
 gt auth logout --host https://git.example.com
 ```
 
@@ -53,9 +54,9 @@ Two kinds of login are managed. The instance is selected by `--host`, `GITEA_CLI
 `GITEA_INSTANCE_URL`. If none is given, the only instance with a stored login is used, but
 `gt auth login` itself needs an explicit instance.
 
-- **Token**: `gt auth login --host <url>` reads the token from a hidden prompt or from stdin and
+- **Token**: `gt auth login --host <url> --with-token` reads the token from a hidden prompt or from stdin and
   stores it. `gt` gets it as `GITEA_TOKEN`.
-- **OAuth**: `gt auth login --host <url> --oauth` runs the real login in a temporary config dir
+- **OAuth** (the default): `gt auth login --host <url>` runs the real login in a temporary config dir
   and stores its whole record (access token, refresh token, expiry, client id) in the backend.
   OAuth tokens expire, so before every call the wrapper restores the record, lets `gt` refresh
   it, writes it back when it changed, and gives `gt` the access token as `GITEA_TOKEN`. This runs

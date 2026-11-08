@@ -337,10 +337,15 @@ __gh_store_from_stdin() {
 gh_login() {
   local backend="$1" real="$2"
   shift 2
-  local arg with_token=0 host
+  local arg with_token=0 web=0 host
   for arg in "$@"; do
     [[ "$arg" != "--with-token" ]] || with_token=1
+    [[ "$arg" != "--web" && "$arg" != "-w" ]] || web=1
   done
+  # the browser flow is the default, unless a token comes in.
+  if ((!with_token && !web)); then
+    set -- --web "$@"
+  fi
   host="$(gh_host_arg "$@")"
   host="${host:-${GH_HOST:-github.com}}"
 
@@ -349,13 +354,11 @@ gh_login() {
     return 0
   fi
 
-  # the browser or device flow runs in a tmpfs config dir, so no plaintext token reaches a disk.
-  local base="${XDG_RUNTIME_DIR:-/dev/shm}" cfg entry
-  [[ -d "$base" ]] ||
-    __die "no tmpfs at $base for the login flow: pipe the token into 'gh auth login --with-token'"
+  # the browser flow runs in a temporary config dir (tmpfs where there is one), so no plaintext
+  # token stays on a disk.
+  local cfg entry
   cfg="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
-  umask 077
-  __tmp_dir="$(mktemp -d "$base/gh-login.XXXXXX")"
+  __tmp_dir="$(__secret_tmp_dir)" || __die "no directory for the login flow"
 
   "${backend}_login_begin"
 
@@ -609,10 +612,10 @@ gt_inject() {
 gt_login() {
   local backend="$1" real="$2"
   shift 2
-  local arg host token entry oauth=0
+  local arg host token entry oauth=1
   for arg in "$@"; do
     case "$arg" in
-    --oauth | --client-id* | --scopes*) oauth=1 ;;
+    --with-token) oauth=0 ;;
     --ssh-* | --client-cert* | --client-key* | --header* | --insecure | --credential-store*)
       __die "'$arg' is not supported by the wrapper: it stores tokens and OAuth logins only"
       ;;
