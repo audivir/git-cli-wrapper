@@ -96,7 +96,14 @@ store="$STUB_STORE"
 case "$1" in
 config | setup | ls) exit 0 ;;
 show) cat "$store/${3//\//_}" 2>/dev/null || exit 1 ;;
-insert) cat >"$store/${3//\//_}" ;;
+insert)
+  # a locked identity needs the passphrase in env, like the age backend of gopass
+  if [[ "${STUB_GOPASS_LOCKED:-}" == 1 && "${GOPASS_AGE_PASSWORD:-}" != pw ]]; then
+    echo "failed to encrypt" >&2
+    exit 1
+  fi
+  cat >"$store/${3//\//_}"
+  ;;
 rm) rm -f "$store/${3//\//_}" ;;
 esac
 EOF
@@ -295,6 +302,16 @@ if command -v python3 >/dev/null 2>&1; then
     '[[ $RC -eq 0 && -e "$T/store/oauth.example.test_gt-oauth" ]]'
   check "an address that is not on loopback is ignored" '[[ "$OUT" == *"ignored"* ]]'
 fi
+
+# a locked gopass identity: the passphrase comes from env, or the wrapper stops without storing
+reset_state
+run_in "locked-token" STUB_GOPASS_LOCKED=1 GOPASS_AGE_PASSWORD=pw gt auth login --host https://git.example.test --with-token
+check "a locked gopass identity is unlocked through the passphrase in env" \
+  '[[ $RC -eq 0 && "$(cat "$T/store/git.example.test_gt-token")" == "locked-token" ]]'
+reset_state
+run_in "locked-token" STUB_GOPASS_LOCKED=1 gt auth login --host https://git.example.test --with-token
+check "without a passphrase or terminal a locked identity stores nothing" \
+  '[[ $RC -ne 0 && "$OUT" == *"failed to encrypt"* && ! -e "$T/store/git.example.test_gt-token" ]]'
 
 # tokens must not appear in the process list of the stub calls: the wrapper never puts them in
 # the arguments of gopass.

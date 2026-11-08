@@ -139,7 +139,12 @@ gopass_set() {
   local token
   token="$(cat)"
   [[ -n "$token" ]] || return 1
-  printf '%s\n' "$token" | gopass insert --force "$1" >/dev/null
+  # the passphrase goes in through env: the token is on stdin, where a prompt would read it.
+  (
+    # shellcheck disable=SC2030 # the passphrase stays in this subshell and its gopass call.
+    [[ -z "$__passphrase" ]] || export GOPASS_AGE_PASSWORD="$__passphrase"
+    printf '%s\n' "$token" | gopass insert --force "$1" >/dev/null
+  )
 }
 
 gopass_del() {
@@ -166,7 +171,7 @@ __gopass_setup_store() {
   echo >&2
   [[ -n "$passphrase" && "$passphrase" == "$again" ]] || __die "passphrases empty or differ"
   (
-    # shellcheck disable=SC2030 # the passphrase is meant to stay inside this subshell.
+    # shellcheck disable=SC2030,SC2031 # the passphrase is meant to stay inside this subshell.
     export GOPASS_AGE_PASSWORD="$passphrase"
     __no_echo gopass setup --crypto age --storage fs >&2
   ) || __die "gopass setup failed"
@@ -193,13 +198,17 @@ gopass_login_begin() {
   __gopass_drop_recipients_hash
 }
 
-# unlocks from the terminal first, as a prompt inside insert would read the piped token.
+# gopass encrypts to the identity of the age key too, which is locked by its passphrase. Listing
+# does not unlock it, so a later insert would prompt on stdin and read the piped token as the
+# passphrase. The passphrase is asked here, hidden, and handed to the insert through env.
 gopass_login_unlock() {
-  (
-    # shellcheck disable=SC2031 # a separate subshell exports it again.
-    [[ -z "$__passphrase" ]] || export GOPASS_AGE_PASSWORD="$__passphrase"
-    __no_echo gopass ls --flat >/dev/null
-  ) || __die "could not unlock gopass, nothing stored"
+  # shellcheck disable=SC2031 # reads the env of the caller, not a subshell export.
+  [[ -z "$__passphrase" && -z "${GOPASS_AGE_PASSWORD:-}" ]] || return 0
+  # without a terminal the agent may already be unlocked, so it is tried as is.
+  [[ -t 0 && -r /dev/tty ]] || return 0
+  read -rsp "$TOOL: passphrase of the gopass age key: " __passphrase </dev/tty >&2
+  echo >&2
+  [[ -n "$__passphrase" ]] || __die "no passphrase given, nothing stored"
 }
 
 # ---------------------------------------------------------------------------------------------
