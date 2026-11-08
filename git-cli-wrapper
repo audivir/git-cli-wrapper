@@ -17,6 +17,7 @@ TOOL=""
 __tmp_dir=""
 __lock_dir=""
 __bg_pid=""
+__native_args=()
 __tty_state=""
 __passphrase=""
 
@@ -791,6 +792,24 @@ __find_real() {
   __die "real $TOOL not found in PATH"
 }
 
+# the native backend keeps the storage of the tool, but a login still defaults to the browser:
+# adds --web for gh and --oauth for gt, unless the call names a method. Result in __native_args.
+__native_login_default() {
+  local arg
+  __native_args=("$@")
+  for arg in "${@:3}"; do
+    case "$TOOL:$arg" in
+    gh:--with-token | gh:--web | gh:-w) return 0 ;;
+    gt:--with-token | gt:--oauth | gt:--ssh-* | gt:--client-id* | gt:--scopes*) return 0 ;;
+    esac
+  done
+  if [[ "$TOOL" == "gh" ]]; then
+    __native_args=("$1" "$2" --web "${@:3}")
+  else
+    __native_args=("$1" "$2" --oauth "${@:3}")
+  fi
+}
+
 main() {
   case "$(basename -- "$0")" in
   gh | gt) TOOL="$(basename -- "$0")" ;;
@@ -827,6 +846,10 @@ main() {
       else
         __unlock_keychain
       fi
+    fi
+    if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+      __native_login_default "$@"
+      exec "$real" "${__native_args[@]}"
     fi
     exec "$real" "$@"
   fi

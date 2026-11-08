@@ -96,6 +96,8 @@ Set `GIT_CLI_WRAPPER_BACKEND`:
 - With `gopass`, a login asks for the passphrase of the age key only if the store cannot be written
   without it, for example when the agent is locked. `GOPASS_AGE_PASSWORD` gives it up front.
 - `GH_TOKEN_ENTRY` overrides the gopass entry for `github.com`.
+- With `native`, a login still defaults to the browser: `--web` is added for `gh` and `--oauth` for
+  `gt`, unless the call names a method (`--with-token`, `--ssh-key`, ...).
 - With `native` on macOS, the wrapper only unlocks the keychain, so `gh` and `gt` do not fall back
   to plaintext files while it is locked.
 

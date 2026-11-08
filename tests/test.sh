@@ -356,6 +356,20 @@ check "the native backend never injects" '[[ "$OUT" == *"GH_TOKEN= "* ]]'
 BACKEND=bogus run gh api user
 check "an unknown backend is an error" '[[ $RC -ne 0 && "$OUT" == *"unknown backend"* ]]'
 
+reset_state
+BACKEND=native run gt auth login --host https://git.example.test
+check "the native backend logs in with OAuth by default" '[[ $RC -eq 0 ]]'
+BACKEND=native run gt auth login --host https://git.example.test --with-token
+check "the native backend leaves an explicit method alone" '[[ $RC -ne 0 && "$OUT" == *"needs --oauth"* ]]'
+rm -f "$T/store/gh_login_args"
+BACKEND=native run gh auth login
+check "the native backend logs gh in through the browser by default" \
+  '[[ "$(cat "$T/store/gh_login_args")" == *"--web"* ]]'
+rm -f "$T/store/gh_login_args"
+BACKEND=native run gh auth login --with-token
+check "the native backend adds no --web to a token login" \
+  '[[ "$(cat "$T/store/gh_login_args")" != *"--web"* ]]'
+
 run "$WRAPPER" gt repos list
 check "the wrapper can be called with the tool as first argument" '[[ $RC -eq 0 && "$OUT" == gt\ * ]]'
 run "$WRAPPER" glab list
