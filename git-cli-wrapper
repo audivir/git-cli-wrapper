@@ -255,14 +255,16 @@ keychain_login_unlock() {
 # unlocks the default keychain first. A token in env needs no keychain. Without a terminal it
 # only warns, except for login, which would store the token in plaintext.
 __unlock_keychain() {
-  security show-keychain-info >/dev/null 2>&1 && return 0
+  local file
+  file="$(__keychain_file)"
+  security show-keychain-info ${file:+"$file"} >/dev/null 2>&1 && return 0
   if [[ -t 0 && -t 2 ]]; then
     __eprint "keychain is locked, unlock it so the token is not stored in plaintext"
-    security unlock-keychain || __die "could not unlock keychain"
+    security unlock-keychain ${file:+"$file"} || __die "could not unlock keychain"
   elif [[ "${1:-}" == "login" ]]; then
-    __die "keychain is locked: run security unlock-keychain first"
+    __die "keychain is locked: run security unlock-keychain ${file:-} first"
   else
-    __eprint "keychain is locked: run security unlock-keychain"
+    __eprint "keychain is locked: run security unlock-keychain ${file:-}"
   fi
 }
 
