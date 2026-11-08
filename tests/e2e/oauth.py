@@ -8,8 +8,8 @@ Needs a Gitea with the user below, and the real gt in PATH. Run through tests/e2
 starts Gitea in Docker, or point GITEA_URL at an existing one. The browser is Playwright's
 Chromium (uv run --with playwright playwright install chromium).
 
-gt opens the authorize URL with open or xdg-open. Shims of both record the URL, and Playwright
-signs in and approves the app there, so the login finishes without a human.
+gt opens the authorize URL with the program in BROWSER. A script there records the URL, and
+Playwright signs in and approves the app there, so the login finishes without a human.
 """
 
 # ruff: noqa: S603, S607, S105  # the harness runs known tools with a test-only password
@@ -43,19 +43,15 @@ def check(condition: bool, message: str) -> None:
         sys.exit(1)
 
 
-def make_shims(workdir: Path) -> tuple[Path, Path]:
-    """Return the dir with the opener shims and the dir with the wrapper linked as gt."""
-    shims = workdir / "shims"
-    shims.mkdir()
-    opened = workdir / "opened"
-    for name in ("open", "xdg-open"):
-        shim = shims / name
-        shim.write_text(f'#!/bin/sh\necho "$1" >> "{opened}"\n')
-        shim.chmod(0o755)
+def make_browser(workdir: Path) -> tuple[Path, Path]:
+    """Return the recording BROWSER script and the dir with the wrapper linked as gt."""
+    browser = workdir / "browser"
+    browser.write_text(f'#!/bin/sh\necho "$1" >> "{workdir / "opened"}"\n')
+    browser.chmod(0o755)
     wrapper_bin = workdir / "wrapper-bin"
     wrapper_bin.mkdir()
     (wrapper_bin / "gt").symlink_to(ROOT / "git-cli-wrapper")
-    return shims, wrapper_bin
+    return browser, wrapper_bin
 
 
 def backend_env(workdir: Path) -> dict[str, str]:
@@ -113,11 +109,12 @@ def wait_for_url(opened: Path) -> str:
 def main() -> None:
     workdir = Path(tempfile.mkdtemp(prefix="gcw-e2e."))
     try:
-        shims, wrapper_bin = make_shims(workdir)
+        browser, wrapper_bin = make_browser(workdir)
         env = {
             **os.environ,
             **backend_env(workdir),
-            "PATH": f"{shims}:{wrapper_bin}:{os.environ['PATH']}",
+            "BROWSER": str(browser),
+            "PATH": f"{wrapper_bin}:{os.environ['PATH']}",
         }
         env.pop("GITEA_TOKEN", None)
 
