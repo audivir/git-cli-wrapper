@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+# Keeps the tokens of gh and gt in gopass or the macOS Keychain instead of plaintext files.
+#
+# The behavior depends on the name the script is called with: link it as gh and as gt, in a dir
+# that comes before the real tools in PATH, or call `git-cli-wrapper gh|gt <arguments>`.
+#   auth login   stores the token in the backend (gh: also from its browser or device flow).
+#   auth logout  removes the token from the backend.
+#   anything else runs the real tool with the stored token in its environment variable.
+#
+# Backends, chosen with GIT_CLI_WRAPPER_BACKEND:
+#   gopass    gopass with the age backend (default off macOS).
+#   keychain  the macOS Keychain, through the security command.
+#   native    no wrapping: the real tool keeps its own storage (default on macOS).
+set -euo pipefail
+
+TOOL=""
+__tmp_dir=""
+__tty_state=""
+__passphrase=""
+
+__eprint() {
+  echo "${TOOL:-git-cli-wrapper}: $*" >&2
+}
+
+__die() {
+  __eprint "$@"
+  exit 1
+}
+
+__restore_tty() {
+  if [[ -n "$__tty_state" ]]; then
+    stty "$__tty_state" 2>/dev/null || true
+    __tty_state=""
+  fi
+}
+
+# exit trap: restores terminal echo and removes the tmpfs config dir.
+__cleanup() {
+  __restore_tty
+  [[ -z "$__tmp_dir" ]] || rm -rf -- "$__tmp_dir"
+}
+
+# gopass reads the passphrase with echo on, so runs what may prompt with echo off.
+__no_echo() {
+  local exit_code=0
+  if [[ -t 0 ]]; then
+    __tty_state="$(stty -g 2>/dev/null || true)"
+    stty -echo echonl 2>/dev/null || true
+  fi
+  "$@" || exit_code=$?
+  __restore_tty
+  return "$exit_code"
+}
+
+__usage() {
+  cat >&2 <<'EOF'
+usage: gh|gt <arguments>
+       git-cli-wrapper gh|gt <arguments>
+
+Link this script as gh and gt before the real tools in PATH. See the README for the backends.
+EOF
+}
+
+# the marker records that a token was stored, so plain calls skip the backend (and its prompts)
+# until then. Its content is the instance URL of the token.
+__state_dir() {
+  echo "${XDG_STATE_HOME:-$HOME/.local/state}/git-cli-wrapper/$TOOL"
+}
+
+__marker() {
+  echo "$(__state_dir)/${1//\//_}"
+}
+
+# markers of the former gh wrapper, which only knew gopass.
+__legacy_marker() {
+  echo "${XDG_STATE_HOME:-$HOME/.local/state}/gh-gopass/${1//\//_}"
+}
+
+__marker_exists() {
+  [[ -f "$(__marker "$1")" ]] && return 0
+  [[ "$TOOL" == "gh" && -f "$(__legacy_marker "$1")" ]]
+}
+
+__marker_write() {
+  mkdir -p "$(__state_dir)"
+  printf '%s\n' "${2:-}" >"$(__marker "$1")"
+}
+
+__marker_remove() {
+  rm -f -- "$(__marker "$1")"
+  [[ "$TOOL" != "gh" ]] || rm -f -- "$(__legacy_marker "$1")"
+}
+
+__backend() {
+  local choice="${GIT_CLI_WRAPPER_BACKEND:-auto}"
+  if [[ "$choice" == "auto" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then choice="native"; else choice="gopass"; fi
+  fi
+  case "$choice" in
+  gopass | keychain | native) echo "$choice" ;;
+  *) __die "unknown backend '$choice' in GIT_CLI_WRAPPER_BACKEND (gopass, keychain, native, auto)" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# backend gopass. The functions of a backend are <name>_ready, _get, _set, _del, _login_begin,
+# and _login_unlock.
+# ---------------------------------------------------------------------------------------------
+
+# gopass starts its setup wizard on a terminal without config, so only calls it once a config
+# file exists. Any gopass command writes that file, even without a store.
+gopass_ready() {
+  command -v gopass >/dev/null 2>&1 &&
+    [[ -f "${GOPASS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gopass/config}" ]]
+}
+
+# judged from files, as any gopass call may prompt for the passphrase while the agent is locked.
+__gopass_store_initialized() {
+  local root="${XDG_DATA_HOME:-$HOME/.local/share}/gopass/stores/root"
+  [[ -f "$root/.age-recipients" || -f "$root/.gpg-id" ]]
+}
+
+# prints the token of an entry. The prompt goes to stderr, so it stays visible on a terminal only.
+gopass_get() {
+  gopass_ready || return 0
+  if [[ -t 0 && -t 2 ]]; then
+    __no_echo gopass show --password "$1" | head -n1
+  else
+    gopass show --password "$1" 2>/dev/null </dev/null | head -n1
+  fi
+}
+
+# stores the token from stdin. The agent must be unlocked, or the prompt reads the token.
+gopass_set() {
+  local token
+  token="$(cat)"
+  [[ -n "$token" ]] || return 1
+  printf '%s\n' "$token" | gopass insert --force "$1" >/dev/null
+}
+
+gopass_del() {
+  gopass_ready || return 0
+  __no_echo gopass rm --force "$1" || true
+}
+
+# agent caches the unlocked identity for GIT_CLI_WRAPPER_AGENT_TIMEOUT seconds (default 3600).
+# Configured before the setup so its unlocks are cached, timeout first as enabling unlocks.
+__gopass_configure() {
+  __no_echo gopass config age.agent-timeout "${GIT_CLI_WRAPPER_AGENT_TIMEOUT:-3600}" >/dev/null
+  __no_echo gopass config age.agent-enabled true >/dev/null
+  __no_echo gopass config recipients.check false >/dev/null
+}
+
+# creates the store on first use. The passphrase is read hidden, then given to gopass via env,
+# and kept in __passphrase so that the login can unlock the agent with it.
+__gopass_setup_store() {
+  local passphrase again
+  [[ -t 0 ]] || __die "no gopass store yet: log in on a terminal"
+  read -rsp "$TOOL: new passphrase for the age key of gopass: " passphrase </dev/tty >&2
+  echo >&2
+  read -rsp "$TOOL: repeat it: " again </dev/tty >&2
+  echo >&2
+  [[ -n "$passphrase" && "$passphrase" == "$again" ]] || __die "passphrases empty or differ"
+  (
+    # shellcheck disable=SC2030 # the passphrase is meant to stay inside this subshell.
+    export GOPASS_AGE_PASSWORD="$passphrase"
+    __no_echo gopass setup --crypto age --storage fs >&2
+  ) || __die "gopass setup failed"
+  __gopass_store_initialized || __die "gopass store not initialized after setup"
+  __passphrase="$passphrase"
+}
+
+# setup writes recipients.hash, which differs per machine and is unused while check is false.
+__gopass_drop_recipients_hash() {
+  local config="${GOPASS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gopass/config}" tmp
+  [[ -f "$config" ]] || return 0
+  tmp="$(mktemp)"
+  grep -v -E '^[[:space:]]*hash[[:space:]]*=' "$config" >"$tmp" || true
+  cat "$tmp" >"$config"
+  rm -f -- "$tmp"
+}
+
+gopass_login_begin() {
+  command -v gopass >/dev/null 2>&1 || __die "gopass not found (pmg install gopass)"
+  __gopass_configure
+  if ! __gopass_store_initialized; then
+    __gopass_setup_store
+  fi
+  __gopass_drop_recipients_hash
+}
+
+# unlocks from the terminal first, as a prompt inside insert would read the piped token.
+gopass_login_unlock() {
+  (
+    # shellcheck disable=SC2031 # a separate subshell exports it again.
+    [[ -z "$__passphrase" ]] || export GOPASS_AGE_PASSWORD="$__passphrase"
+    __no_echo gopass ls --flat >/dev/null
+  ) || __die "could not unlock gopass, nothing stored"
+}
+
+# ---------------------------------------------------------------------------------------------
+# backend keychain: generic passwords of the service git-cli-wrapper, account <tool>:<entry>.
+# GIT_CLI_WRAPPER_KEYCHAIN names another keychain file than the default one.
+# ---------------------------------------------------------------------------------------------
+
+keychain_ready() {
+  [[ "$(uname -s)" == "Darwin" ]] && command -v security >/dev/null 2>&1
+}
+
+__keychain_file() {
+  [[ -z "${GIT_CLI_WRAPPER_KEYCHAIN:-}" ]] || echo "$GIT_CLI_WRAPPER_KEYCHAIN"
+}
+
+keychain_get() {
+  local file
+  keychain_ready || return 0
+  file="$(__keychain_file)"
+  security find-generic-password -s git-cli-wrapper -a "$TOOL:$1" -w ${file:+"$file"} 2>/dev/null ||
+    true
+}
+
+# security has no option for a password on stdin, and -w would show the token in the process
+# list, so the command goes to the interactive mode of security through stdin.
+keychain_set() {
+  local token file
+  token="$(cat)"
+  [[ -n "$token" ]] || return 1
+  [[ "$token" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] ||
+    __die "the token has characters that cannot be passed to the keychain safely"
+  file="$(__keychain_file)"
+  printf 'add-generic-password -U -s git-cli-wrapper -a "%s:%s" -w "%s" %s\n' \
+    "$TOOL" "$1" "$token" "${file:+\"$file\"}" | security -i >/dev/null
+}
+
+keychain_del() {
+  local file
+  keychain_ready || return 0
+  file="$(__keychain_file)"
+  security delete-generic-password -s git-cli-wrapper -a "$TOOL:$1" ${file:+"$file"} \
+    >/dev/null 2>&1 || true
+}
+
+keychain_login_begin() {
+  keychain_ready || __die "the keychain backend needs macOS"
+  __unlock_keychain login
+}
+
+keychain_login_unlock() {
+  :
+}
+
+# gh and gt fall back to plaintext files when the keychain is locked, as it is over SSH, so
+# unlocks the default keychain first. A token in env needs no keychain. Without a terminal it
+# only warns, except for login, which would store the token in plaintext.
+__unlock_keychain() {
+  security show-keychain-info >/dev/null 2>&1 && return 0
+  if [[ -t 0 && -t 2 ]]; then
+    __eprint "keychain is locked, unlock it so the token is not stored in plaintext"
+    security unlock-keychain || __die "could not unlock keychain"
+  elif [[ "${1:-}" == "login" ]]; then
+    __die "keychain is locked: run security unlock-keychain first"
+  else
+    __eprint "keychain is locked: run security unlock-keychain"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# the tool gh
+# ---------------------------------------------------------------------------------------------
+
+# gopass entry per host: github/gh-token for github.com (GH_TOKEN_ENTRY), <host>/gh-token else.
+gh_entry() {
+  if [[ "$1" == "github.com" ]]; then
+    echo "${GH_TOKEN_ENTRY:-github/gh-token}"
+  else
+    echo "$1/gh-token"
+  fi
+}
+
+# host from -h, --hostname <host>, or --hostname=<host> in arguments, if any.
+gh_host_arg() {
+  local prev="" arg
+  for arg in "$@"; do
+    case "$arg" in
+    --hostname=*)
+      echo "${arg#--hostname=}"
+      return 0
+      ;;
+    esac
+    case "$prev" in
+    -h | --hostname)
+      echo "$arg"
+      return 0
+      ;;
+    esac
+    prev="$arg"
+  done
+}
+
+# exports the stored token unless env has one: GH_TOKEN on github.com, enterprise token else.
+gh_inject() {
+  local backend="$1" host token_var env_token token
+  host="${GH_HOST:-github.com}"
+  if [[ "$host" == "github.com" ]]; then
+    token_var="GH_TOKEN"
+    env_token="${GH_TOKEN:-}${GITHUB_TOKEN:-}"
+  else
+    token_var="GH_ENTERPRISE_TOKEN"
+    env_token="${GH_ENTERPRISE_TOKEN:-}${GITHUB_ENTERPRISE_TOKEN:-}"
+  fi
+  [[ -z "$env_token" ]] || return 0
+  __marker_exists "$(gh_entry "$host")" || return 0
+  token="$("${backend}_get" "$(gh_entry "$host")" || true)"
+  [[ -z "$token" ]] || export "$token_var=$token"
+}
+
+# runs real gh without tokens in env, as gh refuses to log in or out with them.
+__gh_clean() {
+  env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN "$@"
+}
+
+# stores the token that gh reads from stdin, when called with --with-token.
+__gh_store_from_stdin() {
+  local backend="$1" host="$2" entry token
+  entry="$(gh_entry "$host")"
+  token="$(cat)"
+  [[ -n "$token" ]] || __die "no token on stdin, nothing stored"
+  "${backend}_login_begin"
+  "${backend}_login_unlock"
+  printf '%s\n' "$token" | "${backend}_set" "$entry" || __die "could not store the token"
+  __marker_write "$entry" "$host"
+  __eprint "token for $host stored with the $backend backend ($entry)"
+}
+
+gh_login() {
+  local backend="$1" real="$2"
+  shift 2
+  local arg with_token=0 host
+  for arg in "$@"; do
+    [[ "$arg" != "--with-token" ]] || with_token=1
+  done
+  host="$(gh_host_arg "$@")"
+  host="${host:-${GH_HOST:-github.com}}"
+
+  if ((with_token)); then
+    __gh_store_from_stdin "$backend" "$host"
+    return 0
+  fi
+
+  # the browser or device flow runs in a tmpfs config dir, so no plaintext token reaches a disk.
+  local base="${XDG_RUNTIME_DIR:-/dev/shm}" cfg entry
+  [[ -d "$base" ]] ||
+    __die "no tmpfs at $base for the login flow: pipe the token into 'gh auth login --with-token'"
+  cfg="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
+  umask 077
+  __tmp_dir="$(mktemp -d "$base/gh-login.XXXXXX")"
+
+  "${backend}_login_begin"
+
+  # keeps preferences (git_protocol, ...), but not the accounts.
+  [[ ! -f "$cfg/config.yml" ]] || cp -- "$cfg/config.yml" "$__tmp_dir/config.yml"
+
+  # --insecure-storage writes the token to the tmp hosts.yml, never to a keyring.
+  GH_CONFIG_DIR="$__tmp_dir" __gh_clean "$real" auth login --insecure-storage "$@" ||
+    __die "login failed"
+
+  # the tmp dir holds only this login, so its host is the first top-level key of hosts.yml.
+  if [[ -z "$(gh_host_arg "$@")" ]]; then
+    host="$(sed -n 's/^\([^ #][^ ]*\):[[:space:]]*$/\1/p' "$__tmp_dir/hosts.yml" | head -n1)"
+  fi
+  entry="$(gh_entry "$host")"
+
+  "${backend}_login_unlock"
+  GH_CONFIG_DIR="$__tmp_dir" __gh_clean "$real" auth token --hostname "$host" |
+    "${backend}_set" "$entry" || __die "no token obtained, nothing stored"
+  __marker_write "$entry" "$host"
+  __eprint "token for $host stored with the $backend backend ($entry)"
+}
+
+gh_logout() {
+  local backend="$1" real="$2"
+  shift 2
+  local host entry
+  host="$(gh_host_arg "$@")"
+  host="${host:-${GH_HOST:-github.com}}"
+  entry="$(gh_entry "$host")"
+  if __marker_exists "$entry"; then
+    "${backend}_del" "$entry"
+  fi
+  __marker_remove "$entry"
+
+  # also drops a legacy login of the real config. Not logged in is fine.
+  __gh_clean "$real" auth logout "$@" 2>/dev/null || true
+  __eprint "token for $host removed ($backend backend)"
+  if [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+    __eprint "GH_TOKEN or GITHUB_TOKEN is still set in this shell, unset it"
+  fi
+}
+
+# the tracked hosts.yml may come from another machine and would show as a second invalid
+# account, so reports status against a config dir without it.
+gh_status() {
+  local real="$1" cfg
+  shift
+  cfg="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
+  __tmp_dir="$(mktemp -d)"
+  [[ ! -f "$cfg/config.yml" ]] || cp -- "$cfg/config.yml" "$__tmp_dir/config.yml"
+  GH_CONFIG_DIR="$__tmp_dir" "$real" "$@"
+}
+
+# ---------------------------------------------------------------------------------------------
+# the tool gt. Only token logins are managed, as OAuth tokens expire and are refreshed by gt.
+# ---------------------------------------------------------------------------------------------
+
+# gives the instance URL a scheme, like gt does.
+__gt_url() {
+  if [[ "$1" == *"://"* ]]; then echo "${1%/}"; else echo "https://${1%/}"; fi
+}
+
+# gopass entry per instance: <host and path>/gt-token.
+gt_entry() {
+  local url
+  url="$(__gt_url "$1")"
+  echo "${url#*://}/gt-token"
+}
+
+# instance from --host <url> or --host=<url> in arguments, if any.
+gt_host_arg() {
+  local prev="" arg
+  for arg in "$@"; do
+    case "$arg" in
+    --host=*)
+      echo "${arg#--host=}"
+      return 0
+      ;;
+    esac
+    if [[ "$prev" == "--host" ]]; then
+      echo "$arg"
+      return 0
+    fi
+    prev="$arg"
+  done
+}
+
+# instance of this call: --host, GITEA_CLI_HOST, GITEA_INSTANCE_URL, else the only instance with
+# a stored token.
+gt_current_host() {
+  local host marker found=""
+  host="$(gt_host_arg "$@")"
+  host="${host:-${GITEA_CLI_HOST:-${GITEA_INSTANCE_URL:-}}}"
+  if [[ -n "$host" ]]; then
+    echo "$host"
+    return 0
+  fi
+  for marker in "$(__state_dir)"/*; do
+    [[ -f "$marker" ]] || continue
+    [[ -z "$found" ]] || return 0
+    found="$(head -n1 "$marker")"
+  done
+  [[ -z "$found" ]] || echo "$found"
+}
+
+# exports the stored token as GITEA_TOKEN for the instance, unless env has a token.
+gt_inject() {
+  local backend="$1" host token
+  shift
+  [[ -z "${GITEA_TOKEN:-}" ]] || return 0
+  host="$(gt_current_host "$@")"
+  [[ -n "$host" ]] || return 0
+  __marker_exists "$(gt_entry "$host")" || return 0
+  token="$("${backend}_get" "$(gt_entry "$host")" || true)"
+  [[ -n "$token" ]] || return 0
+  export GITEA_TOKEN="$token"
+  if [[ -z "${GITEA_CLI_HOST:-}${GITEA_INSTANCE_URL:-}" ]]; then
+    export GITEA_INSTANCE_URL
+    GITEA_INSTANCE_URL="$(__gt_url "$host")"
+  fi
+}
+
+gt_login() {
+  local backend="$1"
+  shift 2
+  local arg host token entry
+  for arg in "$@"; do
+    case "$arg" in
+    --host | --host=* | --with-token | -y | --yes) ;;
+    --oauth | --client-id* | --scopes* | --ssh-* | --client-* | --header* | --insecure | --credential-store*)
+      __die "'$arg' is not supported by the wrapper: it stores a token that you give with --with-token"
+      ;;
+    esac
+  done
+  # no fallback to the only stored instance here: a login must not overwrite one by accident.
+  host="$(gt_host_arg "$@")"
+  host="${host:-${GITEA_CLI_HOST:-${GITEA_INSTANCE_URL:-}}}"
+  [[ -n "$host" ]] || __die "which instance? give --host <url> or set GITEA_CLI_HOST"
+  host="$(__gt_url "$host")"
+  entry="$(gt_entry "$host")"
+
+  if [[ -t 0 ]]; then
+    read -rsp "$TOOL: access token for $host: " token </dev/tty >&2
+    echo >&2
+  else
+    token="$(cat)"
+  fi
+  token="${token//[$'\r\n\t ']/}"
+  [[ -n "$token" ]] || __die "no token given, nothing stored"
+
+  "${backend}_login_begin"
+  "${backend}_login_unlock"
+  printf '%s\n' "$token" | "${backend}_set" "$entry" || __die "could not store the token"
+  __marker_write "$entry" "$host"
+  __eprint "token for $host stored with the $backend backend ($entry)"
+}
+
+gt_logout() {
+  local backend="$1" real="$2"
+  shift 2
+  local host entry
+  host="$(gt_current_host "$@")"
+  [[ -n "$host" ]] || __die "which instance? give --host <url> or set GITEA_CLI_HOST"
+  entry="$(gt_entry "$host")"
+  if __marker_exists "$entry"; then
+    "${backend}_del" "$entry"
+  fi
+  __marker_remove "$entry"
+
+  # also drops a login of gt itself. Not logged in is fine.
+  env -u GITEA_TOKEN "$real" auth logout "$@" 2>/dev/null || true
+  __eprint "token for $host removed ($backend backend)"
+}
+
+# ---------------------------------------------------------------------------------------------
+
+# real tool: first one in PATH that is not this script, however it is linked or copied.
+__find_real() {
+  local dir candidate path_dirs
+  IFS=: read -ra path_dirs <<<"$PATH"
+  for dir in "${path_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    candidate="$dir/$TOOL"
+    [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+    [[ "$candidate" -ef "$0" ]] && continue
+    echo "$candidate"
+    return 0
+  done
+  __die "real $TOOL not found in PATH"
+}
+
+main() {
+  case "$(basename -- "$0")" in
+  gh | gt) TOOL="$(basename -- "$0")" ;;
+  *)
+    case "${1:-}" in
+    gh | gt)
+      TOOL="$1"
+      shift
+      ;;
+    *)
+      __usage
+      exit 2
+      ;;
+    esac
+    ;;
+  esac
+
+  # two wrappers that find each other would loop. gh may call itself through git, so a few levels
+  # are normal.
+  if ((${GIT_CLI_WRAPPER_DEPTH:-0} > 20)); then
+    __die "wrappers call each other: no real $TOOL found before another copy of the wrapper"
+  fi
+  export GIT_CLI_WRAPPER_DEPTH=$((${GIT_CLI_WRAPPER_DEPTH:-0} + 1))
+
+  local real backend exit_code=0
+  real="$(__find_real)" || exit 1
+  backend="$(__backend)"
+
+  if [[ "$backend" == "native" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v security >/dev/null 2>&1 &&
+      [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}${GH_ENTERPRISE_TOKEN:-}${GITHUB_ENTERPRISE_TOKEN:-}${GITEA_TOKEN:-}" ]]; then
+      if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+        __unlock_keychain login
+      else
+        __unlock_keychain
+      fi
+    fi
+    exec "$real" "$@"
+  fi
+
+  trap __cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  # terminal prompt, as pinentry needs GPG_TTY and is missing in many containers.
+  export GOPASS_AGE_STDIN_PASSPHRASE="${GOPASS_AGE_STDIN_PASSPHRASE:-1}"
+
+  if [[ "${1:-}" == "auth" ]]; then
+    case "${2:-}" in
+    login)
+      "${TOOL}_login" "$backend" "$real" "${@:3}"
+      exit 0
+      ;;
+    logout)
+      "${TOOL}_logout" "$backend" "$real" "${@:3}"
+      exit 0
+      ;;
+    status)
+      if [[ "$TOOL" == "gh" ]]; then
+        gh_inject "$backend"
+        gh_status "$real" "$@" || exit_code=$?
+        exit "$exit_code"
+      fi
+      ;;
+    esac
+  fi
+
+  "${TOOL}_inject" "$backend" "$@"
+  exec "$real" "$@"
+}
+
+main "$@"
