@@ -576,7 +576,7 @@ gt_login_oauth() {
   __tmp_dir="$dir"
   "${backend}_login_begin"
   XDG_CONFIG_HOME="$dir" env -u GITEA_TOKEN "$real" auth login --host "$host" \
-    --credential-store file "$@" || __die "login failed"
+    --oauth --credential-store file "$@" || __die "login failed"
   key="$(sed -n 's/^    \(.*\):$/\1/p' "$dir/gitea-cli/hosts.yml" | head -n1)"
   id="$(sed -n 's/^        oauth_client_id: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"
   user="$(sed -n 's/^        user: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"

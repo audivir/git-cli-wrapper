@@ -36,6 +36,7 @@ cat >"$T/real/gt" <<'EOF'
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/gitea-cli"
 if [[ "$1 $2" == "auth login" ]]; then
   host=""
+  [[ " $* " == *" --oauth "* ]] || { echo "needs --oauth without a terminal" >&2; exit 1; }
   while (($#)); do [[ "$1" != --host ]] || host="$2"; shift; done
   mkdir -p "$cfg/credentials"
   printf 'version: "1"\nhosts:\n    %s:\n        user: tester\n        oauth_client_id: client-1\n        users:\n            tester:\n                auth_method: oauth\n                credential_store: file\n' "$host" >"$cfg/hosts.yml"
