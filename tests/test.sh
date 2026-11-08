@@ -313,6 +313,22 @@ run_in "locked-token" STUB_GOPASS_LOCKED=1 gt auth login --host https://git.exam
 check "without a passphrase or terminal a locked identity stores nothing" \
   '[[ $RC -ne 0 && "$OUT" == *"failed to encrypt"* && ! -e "$T/store/git.example.test_gt-token" ]]'
 
+# locked identity: the passphrase is asked only after the first insert failed
+reset_state
+printf 'pw\n' >"$T/pass"
+run_in "locked-token" STUB_GOPASS_LOCKED=1 GIT_CLI_WRAPPER_PASSPHRASE_FROM="$T/pass" gt auth login --host https://git.example.test --with-token
+check "a locked identity asks for the passphrase and retries" \
+  '[[ $RC -eq 0 && "$OUT" == *"passphrase of the gopass age key"* && "$(cat "$T/store/git.example.test_gt-token")" == "locked-token" ]]'
+reset_state
+printf 'wrong\n' >"$T/pass"
+run_in "locked-token" STUB_GOPASS_LOCKED=1 GIT_CLI_WRAPPER_PASSPHRASE_FROM="$T/pass" gt auth login --host https://git.example.test --with-token
+check "a wrong passphrase stores nothing" \
+  '[[ $RC -ne 0 && ! -e "$T/store/git.example.test_gt-token" ]]'
+reset_state
+run_in "open-token" GIT_CLI_WRAPPER_PASSPHRASE_FROM="$T/pass" gt auth login --host https://git.example.test --with-token
+check "an unlocked agent is never asked" \
+  '[[ $RC -eq 0 && "$OUT" != *"passphrase of the gopass age key"* ]]'
+
 # tokens must not appear in the process list of the stub calls: the wrapper never puts them in
 # the arguments of gopass.
 check "the stub gopass never saw a token as an argument" \

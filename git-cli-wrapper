@@ -134,17 +134,45 @@ gopass_get() {
   fi
 }
 
-# stores the token from stdin. The agent must be unlocked, or the prompt reads the token.
-gopass_set() {
-  local token
-  token="$(cat)"
-  [[ -n "$token" ]] || return 1
-  # the passphrase goes in through env: the token is on stdin, where a prompt would read it.
+# one gopass insert of the record $2 into the entry $1. The passphrase goes in through env,
+# as the record is on stdin, where a prompt for the passphrase would read it.
+__gopass_insert() {
   (
     # shellcheck disable=SC2030 # the passphrase stays in this subshell and its gopass call.
     [[ -z "$__passphrase" ]] || export GOPASS_AGE_PASSWORD="$__passphrase"
-    printf '%s\n' "$token" | gopass insert --force "$1" >/dev/null
+    printf '%s\n' "$2" | gopass insert --force "$1" >/dev/null
   )
+}
+
+# asks for the passphrase of the age key, hidden. GIT_CLI_WRAPPER_PASSPHRASE_FROM, a file, is for
+# tests. Fails if there is nowhere to ask.
+__ask_passphrase() {
+  local source="${GIT_CLI_WRAPPER_PASSPHRASE_FROM:-/dev/tty}"
+  { : <"$source"; } 2>/dev/null || return 1
+  printf '%s: passphrase of the gopass age key: ' "$TOOL" >&2
+  if [[ "$source" == /dev/tty ]]; then
+    read -rs __passphrase <"$source" || true
+    echo >&2
+  else
+    read -r __passphrase <"$source" || true
+    echo >&2
+  fi
+  [[ -n "$__passphrase" ]]
+}
+
+# stores the token from stdin. A locked identity of the age key makes the insert fail, as gopass
+# encrypts to it too, and only then the passphrase is asked. An unlocked agent never asks.
+gopass_set() {
+  local token output
+  token="$(cat)"
+  [[ -n "$token" ]] || return 1
+  output="$(__gopass_insert "$1" "$token" 2>&1)" && return 0
+  # shellcheck disable=SC2031 # reads the env of the caller, not a subshell export.
+  if [[ -z "$__passphrase" && -z "${GOPASS_AGE_PASSWORD:-}" ]] && __ask_passphrase; then
+    output="$(__gopass_insert "$1" "$token" 2>&1)" && return 0
+  fi
+  printf '%s\n' "$output" >&2
+  return 1
 }
 
 gopass_del() {
@@ -198,17 +226,9 @@ gopass_login_begin() {
   __gopass_drop_recipients_hash
 }
 
-# gopass encrypts to the identity of the age key too, which is locked by its passphrase. Listing
-# does not unlock it, so a later insert would prompt on stdin and read the piped token as the
-# passphrase. The passphrase is asked here, hidden, and handed to the insert through env.
+# nothing to do: the passphrase is asked by gopass_set, and only if the insert needs it.
 gopass_login_unlock() {
-  # shellcheck disable=SC2031 # reads the env of the caller, not a subshell export.
-  [[ -z "$__passphrase" && -z "${GOPASS_AGE_PASSWORD:-}" ]] || return 0
-  # without a terminal the agent may already be unlocked, so it is tried as is.
-  [[ -t 0 && -r /dev/tty ]] || return 0
-  read -rsp "$TOOL: passphrase of the gopass age key: " __passphrase </dev/tty >&2
-  echo >&2
-  [[ -n "$__passphrase" ]] || __die "no passphrase given, nothing stored"
+  :
 }
 
 # ---------------------------------------------------------------------------------------------

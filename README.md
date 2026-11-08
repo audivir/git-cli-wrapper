@@ -89,6 +89,8 @@ Set `GIT_CLI_WRAPPER_BACKEND`:
 - `GIT_CLI_WRAPPER_KEYCHAIN` selects another keychain file than the default one.
 - `GIT_CLI_WRAPPER_AGENT_TIMEOUT` sets how long the age agent of gopass stays unlocked, in seconds
   (default 3600).
+- With `gopass`, a login asks for the passphrase of the age key only if the store cannot be written
+  without it, for example when the agent is locked. `GOPASS_AGE_PASSWORD` gives it up front.
 - `GH_TOKEN_ENTRY` overrides the gopass entry for `github.com`.
 - With `native` on macOS, the wrapper only unlocks the keychain, so `gh` and `gt` do not fall back
   to plaintext files while it is locked.
