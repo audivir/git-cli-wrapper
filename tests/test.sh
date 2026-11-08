@@ -66,6 +66,10 @@ PY
   exit 0
 fi
 if [[ "$1 $2" == "auth token" ]]; then
+  grep -q '^default_host: https\?://' "$cfg/config.yml" 2>/dev/null || {
+    echo "Error: default_host must be a normalized instance URL" >&2
+    exit 1
+  }
   file="$(ls "$cfg"/credentials/*.json 2>/dev/null | head -n1)"
   [[ -n "$file" ]] || { echo "no credential" >&2; exit 1; }
   json="$(cat "$file")"
@@ -270,6 +274,12 @@ run gt repos list
 check "the refreshed record is stored, so no second refresh" \
   '[[ "$OUT" == *"GITEA_TOKEN=AT1 "* && "$(cat "$T/store/refreshes")" == 1 ]]'
 check "no credentials stay in the temp dirs" '! ls -d "${TMPDIR:-/tmp}"/git-cli-wrapper.* >/dev/null 2>&1'
+
+reset_state
+run gt auth login --host oauth.example.test
+run gt --host oauth.example.test repos list
+check "an OAuth login is found when the host is written without a scheme" \
+  '[[ "$OUT" == *"GITEA_TOKEN=AT1 "* ]]'
 
 # a record that went stale again, refreshed by five calls at once: the single-use refresh token
 # only survives if they take turns.

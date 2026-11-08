@@ -570,6 +570,8 @@ EOF
 # lock. A call that waits for it then reads the already refreshed record.
 gt_oauth_token() {
   local backend="$1" real="$2" host="$3" entry record dir token file json id user stored
+  # gt wants the normalized URL in its config, however the host was written in the call.
+  host="$(__gt_url "$host")"
   entry="$(gt_oauth_entry "$host")"
   dir="$(__secret_tmp_dir)" || __die "no directory for the credentials"
   __lock "$(__state_dir)/lock-${entry//\//_}"
