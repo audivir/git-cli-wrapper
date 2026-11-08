@@ -96,12 +96,16 @@ def approve(page_url: str) -> None:
         browser.close()
 
 
-def wait_for_url(opened: Path) -> str:
+def wait_for_url(opened: Path, login: subprocess.Popen[str]) -> str:
     deadline = time.monotonic() + URL_TIMEOUT
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and login.poll() is None:
         if opened.exists() and opened.read_text().strip():
             return opened.read_text().splitlines()[0]
         time.sleep(0.2)
+    if login.poll() is None:
+        login.kill()
+    output, _ = login.communicate()
+    print(f"gt exited with {login.returncode} and printed:\n{output}")
     check(False, "gt asked for a browser")
     raise AssertionError
 
@@ -126,7 +130,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        authorize_url = wait_for_url(workdir / "opened")
+        authorize_url = wait_for_url(workdir / "opened", login)
         check(authorize_url.startswith(f"{GITEA_URL}/login/oauth/authorize"), "authorize URL")
         approve(authorize_url)
         output, _ = login.communicate(timeout=LOGIN_TIMEOUT)
