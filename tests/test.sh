@@ -38,6 +38,27 @@ if [[ "$1 $2" == "auth login" ]]; then
   host=""
   [[ " $* " == *" --oauth "* ]] || { echo "needs --oauth without a terminal" >&2; exit 1; }
   while (($#)); do [[ "$1" != --host ]] || host="$2"; shift; done
+  # like gt, wait for the browser to call back on a loopback port
+  if [[ -n "${STUB_CALLBACK_PORT:-}" ]]; then
+    python3 - "$STUB_CALLBACK_PORT" <<'PY' || exit 1
+import http.server, sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.server.ok = "code=abc" in self.path
+        self.send_response(200 if self.server.ok else 400)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+server.timeout = 15
+server.ok = False
+server.handle_request()
+sys.exit(0 if server.ok else 1)
+PY
+  fi
   mkdir -p "$cfg/credentials"
   printf 'version: "1"\nhosts:\n    %s:\n        user: tester\n        oauth_client_id: client-1\n        users:\n            tester:\n                auth_method: oauth\n                credential_store: file\n' "$host" >"$cfg/hosts.yml"
   printf '{"access_token":"AT0","refresh_token":"RT0","expires_at":"stale"}' >"$cfg/credentials/abc.json"
@@ -264,6 +285,16 @@ check "a lock of a dead process is taken over" '[[ "$OUT" == *"GITEA_TOKEN=AT1 "
 
 run gt auth logout --host https://oauth.example.test
 check "gt logout removes the OAuth record" '[[ ! -e "$T/store/oauth.example.test_gt-oauth" ]]'
+
+# the browser cannot reach this machine: its address is pasted and sent to the loopback listener
+if command -v python3 >/dev/null 2>&1; then
+  reset_state
+  printf 'https://evil.example/?code=abc\nhttp://127.0.0.1:39555/?code=abc&state=xyz\n' >"$T/paste"
+  run STUB_CALLBACK_PORT=39555 GIT_CLI_WRAPPER_PASTE_FROM="$T/paste" gt auth login --host https://oauth.example.test
+  check "a pasted callback address completes the login" \
+    '[[ $RC -eq 0 && -e "$T/store/oauth.example.test_gt-oauth" ]]'
+  check "an address that is not on loopback is ignored" '[[ "$OUT" == *"ignored"* ]]'
+fi
 
 # tokens must not appear in the process list of the stub calls: the wrapper never puts them in
 # the arguments of gopass.

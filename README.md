@@ -63,6 +63,14 @@ Two kinds of login are managed. The instance is selected by `--host`, `GITEA_CLI
   under a lock (`mkdir` based, a lock of a dead process is taken over, 60 seconds at most), so
   concurrent calls do not use the same single-use refresh token twice.
 
+**No browser on this machine?** `gt` waits for the browser on `127.0.0.1:<port>` of the machine
+it runs on, which a browser elsewhere cannot reach. Open the printed URL on another machine and
+approve. The browser then fails to load a page at `http://127.0.0.1:<port>/?code=...&state=...`.
+Paste that address into the terminal of the login. The wrapper sends the request to the port on
+its own machine, and the login finishes as if the browser had reached it. This works in parallel
+to the normal callback, so nothing needs to be chosen up front. Only addresses on `127.0.0.1` or
+`localhost` are accepted.
+
 `--ssh-*`, `--client-cert`, `--client-key`, `--header`, `--insecure`, and `--credential-store`
 are refused. `gt auth status` and `gt auth token` ignore `GITEA_TOKEN`, so they do not see the
 stored login.

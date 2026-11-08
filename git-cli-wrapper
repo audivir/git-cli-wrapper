@@ -16,6 +16,7 @@ set -euo pipefail
 TOOL=""
 __tmp_dir=""
 __lock_dir=""
+__bg_pid=""
 __tty_state=""
 __passphrase=""
 
@@ -37,6 +38,7 @@ __restore_tty() {
 
 # exit trap: restores terminal echo and removes the tmpfs config dir.
 __cleanup() {
+  [[ -z "$__bg_pid" ]] || kill "$__bg_pid" 2>/dev/null || true
   [[ -z "$__lock_dir" ]] || rm -rf -- "$__lock_dir"
   __restore_tty
   [[ -z "$__tmp_dir" ]] || rm -rf -- "$__tmp_dir"
@@ -567,6 +569,56 @@ gt_oauth_token() {
   printf '%s' "$token"
 }
 
+# makes the request of a browser that could not reach this machine: gt waits for its OAuth
+# callback on a loopback port, so a pasted http://127.0.0.1:<port>/?code=... address is sent there.
+# Only loopback addresses are accepted. The listener may not be up yet, so it retries for 10 s.
+__forward_callback() {
+  local line="$1" host port path try
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ "$line" =~ ^http://(127\.0\.0\.1|localhost):([0-9]+)(/[^[:space:]]*)$ ]] || return 1
+  host="${BASH_REMATCH[1]}"
+  port="${BASH_REMATCH[2]}"
+  path="${BASH_REMATCH[3]}"
+  for ((try = 0; try < 100; try++)); do
+    if (
+      exec 4<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || exit 1
+      printf 'GET %s HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$path" "$host" "$port" >&4
+      cat <&4 >/dev/null
+    ); then
+      return 0
+    fi
+    sleep 0.1
+  done
+  __eprint "nothing listens on port $port, the login may have ended"
+  return 0
+}
+
+# reads pasted callback addresses from the terminal for as long as process $1 runs. Tests use
+# GIT_CLI_WRAPPER_PASTE_FROM, a file, instead of the terminal.
+__paste_loop() {
+  local pid="$1" source="" line rc
+  if [[ -n "${GIT_CLI_WRAPPER_PASTE_FROM:-}" ]]; then
+    source="$GIT_CLI_WRAPPER_PASTE_FROM"
+  elif [[ -t 0 && -t 2 && -r /dev/tty ]]; then
+    source="/dev/tty"
+    sleep 1
+  fi
+  [[ -n "$source" ]] || return 0
+  exec 3<"$source" || return 0
+  __eprint "no browser on this machine? Open the URL elsewhere, approve, and if the page fails to load, paste its address (http://127.0.0.1:...) here:"
+  while kill -0 "$pid" 2>/dev/null; do
+    rc=0
+    read -r -t 1 line <&3 || rc=$?
+    if ((rc == 0)); then
+      [[ -z "$line" ]] || __forward_callback "$line" || __eprint "ignored: not an address on 127.0.0.1 or localhost"
+    elif ((rc <= 128)); then
+      break
+    fi
+  done
+  exec 3<&-
+}
+
 # runs the real OAuth login in a temporary config dir and keeps its record in the backend.
 gt_login_oauth() {
   local backend="$1" real="$2" host="$3"
@@ -575,8 +627,14 @@ gt_login_oauth() {
   dir="$(__secret_tmp_dir)" || __die "no directory for the credentials"
   __tmp_dir="$dir"
   "${backend}_login_begin"
+  local status=0
   XDG_CONFIG_HOME="$dir" env -u GITEA_TOKEN "$real" auth login --host "$host" \
-    --oauth --credential-store file "$@" || __die "login failed"
+    --oauth --credential-store file "$@" &
+  __bg_pid=$!
+  __paste_loop "$__bg_pid"
+  wait "$__bg_pid" || status=$?
+  __bg_pid=""
+  ((status == 0)) || __die "login failed"
   key="$(sed -n 's/^    \(.*\):$/\1/p' "$dir/gitea-cli/hosts.yml" | head -n1)"
   id="$(sed -n 's/^        oauth_client_id: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"
   user="$(sed -n 's/^        user: *//p' "$dir/gitea-cli/hosts.yml" | head -n1)"
